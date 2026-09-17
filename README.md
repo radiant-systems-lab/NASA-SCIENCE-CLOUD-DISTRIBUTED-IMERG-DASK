@@ -1,129 +1,80 @@
-# Distributed IMERG Precipitation Tracking with Dask
+# ImergView-Dask
 
-This repository contains a reproducible notebook workflow for identifying and tracking precipitation systems in time-ordered IMERG-style NetCDF data. The workflow uses Dask workers on AWS Fargate to parallelize independent per-timestamp operations while preserving the chronological execution required for temporal tracking.
+ImergView investigates how precipitation systems form, evolve, merge, split, and dissipate over time. The broader workflow works with STARE-indexed scientific products derived from NASA Global Precipitation Measurement (GPM) IMERG precipitation observations and Midlatitude Storm Area (MCMS) extra-tropical cyclone tracks derived from MERRA-2 sea-level pressure fields.
+
+These products operate at different resolutions: GPM IMERG precipitation is approximately 10 km every 30 minutes, while the MCMS cyclone product is based on 0.625 x 0.5 degree MERRA-2 fields every three hours. Combining high-resolution gridded observations, spatial feature detection, and chronological tracking makes the experiment computationally intensive and difficult to reproduce consistently.
+
+The notebook in this repository focuses on the precipitation-feature workflow. It reads a time-ordered sequence of IMERG-style NetCDF files containing `PRECTOT`, identifies connected precipitation regions at each timestamp, tracks those regions through time, and creates maps of the tracked systems.
 
 ## Scientific Workflow
 
-The experiment transforms a sequence of precipitation snapshots into labeled, temporally tracked precipitation systems and rendered maps.
-
 ```text
-NetCDF precipitation files
-          |
-          v
-Chronological input selection
-          |
-          v
-Precipitation masks
-          |
-          v
-Connected-component labeling       [distributed by timestamp]
-          |
-          v
-Temporal feature tracking           [sequential by timestamp]
-          |
-          v
-Tracked map generation              [distributed by timestamp]
-          |
-          v
-NumPy arrays, serialized maps, and PNG visualizations
+Time-ordered precipitation snapshots
+                 |
+                 v
+      Precipitation thresholding
+                 |
+                 v
+     Binary precipitation masks
+                 |
+                 v
+  Connected-component identification
+                 |
+                 v
+ Chronological feature association
+                 |
+                 v
+     Tracked precipitation systems
+                 |
+                 v
+       Arrays and map products
 ```
 
-### 1. Input Preparation
+### 1. Select the observations
 
-The notebook searches for NetCDF (`.nc4`) files under the configured local data directories and uses the requested number of files in chronological order. When the required local inputs are unavailable, it can stage them from the configured Amazon S3 prefix while preserving the source directory structure.
+The experiment selects NetCDF precipitation snapshots in chronological order and extracts the observation time from each filename. Maintaining this order is essential because each tracking step depends on the preceding timestamp.
 
-The default demonstration processes four consecutive precipitation snapshots. The input count can be changed with `IMERG_INPUT_FILE_COUNT`.
+### 2. Create precipitation masks
 
-### 2. Precipitation Masking
+For every timestamp, the workflow reads the `PRECTOT` field and applies a precipitation threshold. The result is a time-indexed binary mask that separates qualifying precipitation from the surrounding grid.
 
-Each NetCDF file is read on the notebook coordinator and converted into a precipitation mask. The masks form a time-indexed array that provides a consistent input representation for connected-component analysis.
+### 3. Identify precipitation systems
 
-### 3. Connected-Component Detection
+Connected-component labeling identifies contiguous precipitation regions using eight-neighbor spatial connectivity. Regions smaller than the configured minimum area are removed so that the remaining labels represent substantial precipitation systems rather than isolated grid cells.
 
-Each timestamp is independent at this stage. The coordinator submits one mask at a time to the Dask cluster, where workers:
+### 4. Track systems through time
 
-- identify spatially connected precipitation regions using eight-neighbor connectivity;
-- remove regions below the configured minimum size, which defaults to 625 grid cells; and
-- return the labeled component array to the coordinator.
+The workflow compares labels at each timestamp with labels from the immediately preceding timestamp. Spatial overlap is used to identify continuing systems, new formation, mergers, splits, and dissipation. Stable labels are assigned across the sequence to preserve the history of each tracked system.
 
-The resulting arrays are saved per timestamp and combined into an intermediate serialized component map.
+### 5. Generate scientific products
 
-### 4. Temporal Tracking
+The experiment writes intermediate masks and component maps, tracked label arrays, and one visualization for each processed timestamp. Together, these products expose both the spatial structure and temporal evolution of the detected precipitation systems.
 
-The component maps are processed chronologically to maintain consistent labels as precipitation systems evolve. This stage compares the current timestamp with the preceding timestamp to identify continuing, newly formed, merged, split, and dissipated systems.
+## Why This Experiment Is Challenging to Reproduce
 
-Temporal tracking runs sequentially because the labels at time `t` depend on the tracked state at time `t-1`.
+- The inputs are large, multidimensional scientific files sampled at frequent time intervals.
+- Feature identification operates over every grid cell in every selected snapshot.
+- Some stages can process timestamps independently, while temporal tracking must preserve strict chronological dependencies.
+- The workflow combines NetCDF I/O, numerical arrays, connected-component labeling, geospatial plotting, and serialized intermediate products.
+- Results depend on consistent input ordering, thresholds, connectivity rules, package versions, and filesystem layout.
 
-### 5. Map Generation
+## Data Context
 
-After tracking is complete, rendering is distributed across the Dask workers. Each task receives one tracked timestamp and creates a PNG map with its corresponding observation time. The coordinator gathers completion results and retains the generated files in the experiment output directory.
+| Scientific product | Source | Spatial resolution | Temporal resolution |
+|---|---|---:|---:|
+| Precipitation | GPM IMERG | Approximately 10 km | 30 minutes |
+| Extra-tropical cyclones | MCMS from MERRA-2 sea-level pressure | 0.625 x 0.5 degrees | 3 hours |
 
-## Distributed Execution Model
+The ImergView ecosystem uses STARE, pySTARE, and STAREPandas to support spatiotemporal indexing and analysis across these products. The notebook in this repository demonstrates the precipitation-system detection and tracking portion of that larger scientific problem.
 
-The notebook creates an on-demand Dask cluster in AWS ECS Fargate:
+## Notebook
 
-```text
-Jupyter notebook coordinator
-          |
-          +---- Dask scheduler task
-          |
-          +---- Dask worker task 1
-          +---- Dask worker task 2
-          +---- Dask worker task 3
-          +---- Dask worker task 4
-```
+`ImergView-Dask.ipynb` contains the complete experiment, including input selection, precipitation masking, connected-component identification, temporal tracking, output generation, and resource cleanup.
 
-The default cluster configuration is:
+Run the notebook from top to bottom. The final outputs include:
 
-| Component | Count | CPU | Memory | Threads |
-|---|---:|---:|---:|---:|
-| Scheduler | 1 | 1 vCPU | 2 GiB | N/A |
-| Worker | 4 | 1 vCPU each | 4 GiB each | 1 each |
-
-The worker count and task sizes are configurable through environment variables. Increasing the worker count can accelerate connected-component detection and plotting when enough timestamps are available. It does not parallelize temporal tracking, whose dependency chain is inherently ordered in the current implementation.
-
-## Runtime Configuration
-
-The portal or runtime environment supplies the AWS cluster, identity, network, and container settings used by the notebook.
-
-| Variable | Purpose | Default |
-|---|---|---:|
-| `IMERG_INPUT_FILE_COUNT` | Number of chronological NetCDF files to process | `4` |
-| `DASK_WORKER_COUNT` | Number of Fargate worker tasks | `4` |
-| `DASK_WORKER_CPU` | CPU units allocated to each worker | `1024` |
-| `DASK_WORKER_MEMORY` | Memory in MiB allocated to each worker | `4096` |
-| `DASK_WORKER_THREADS` | Dask threads per worker | `1` |
-| `DASK_SCHEDULER_CPU` | CPU units allocated to the scheduler | `1024` |
-| `DASK_SCHEDULER_MEMORY` | Memory in MiB allocated to the scheduler | `2048` |
-| `INPUT_S3_PREFIX` | S3 prefix containing the input data | Runtime supplied |
-| `DASK_WORKER_IMAGE` | Container image used by scheduler and workers | Runtime supplied |
-| `DASK_ECS_CLUSTER_ARN` | ECS cluster used for temporary Dask tasks | Runtime supplied |
-| `DASK_EXECUTION_ROLE_ARN` | ECS task execution role | Runtime supplied |
-| `DASK_TASK_ROLE_ARN` | Application task role | Runtime supplied |
-| `DASK_SUBNET_IDS` | Subnets used by the Dask tasks | Runtime supplied |
-| `DASK_SECURITY_GROUP_IDS` | Security groups used by the Dask tasks | Runtime supplied |
-
-## Outputs
-
-Results are written under `/workspace/output/` and include:
-
-- a time-indexed precipitation mask array;
-- one connected-component array per timestamp;
-- an intermediate serialized component map;
-- one temporally tracked component array per timestamp; and
-- one tracked PNG map per timestamp.
-
-For the default four-file run, the workflow produces four per-timestamp component arrays, four tracked arrays, and four tracked maps.
-
-## Repository Notebooks
-
-| Notebook | Purpose |
-|---|---|
-| `1_IMERGDASK_FLINC_NASA_ESTIM_DEMO_PARALLEL.ipynb` | Implements input staging, scientific processing, distributed execution, and cleanup. |
-| `2_AFTER_CAPTURE_AUDIT_VERIFY.ipynb` | Verifies the captured inputs and generated workflow artifacts. |
-
-Run the main workflow notebook from top to bottom so that inputs are prepared before cluster startup and the temporary Dask resources are shut down after processing. The verification notebook can then be used to inspect the resulting capture and workflow artifacts.
-
-## Resource Lifecycle
-
-The Dask scheduler and workers are temporary Fargate tasks. The final cleanup cell closes the Dask client and cluster, and it should be run after successful completion or after any processing failure. This cleanup is separate from stopping the surrounding Jupyter environment.
+- a time-indexed precipitation mask;
+- connected-component arrays for each timestamp;
+- serialized intermediate component maps;
+- temporally tracked component arrays; and
+- one tracked precipitation map per timestamp.
